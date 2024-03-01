@@ -1,0 +1,10 @@
+Djibouti;-1.0
+Lomé;26.0
+Tegucigalpa;24.8
+Jos;24.9
+Albuquerque;9.3
+Kansas City;11.4
+Astana;-15.6
+Vienna;20.7
+Ifrane;-13.5
+Ljubljana;13.0
