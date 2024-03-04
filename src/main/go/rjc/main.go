@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"flag"
 	"fmt"
 	"log"
@@ -9,7 +10,7 @@ import (
 	"os"
 	"runtime/pprof"
 	"sort"
-	"strings"
+	"unsafe"
 )
 
 var cpuprofile = flag.String("cpuprofile", "", "write cpu profile to `file`")
@@ -18,6 +19,53 @@ var memprofile = flag.String("memprofile", "", "write memory profile to `file`")
 func pie(e error) {
 	if e != nil {
 		panic(e)
+	}
+}
+
+func UnsafeBytesToString(b []byte) string {
+	return unsafe.String(unsafe.SliceData(b), len(b))
+}
+
+type Statistic struct {
+	keys     []byte
+	measures map[string]*M
+}
+
+func newStatistic() *Statistic {
+	return &Statistic{
+		keys:     make([]byte, 0, 8*1024),
+		measures: make(map[string]*M),
+	}
+}
+
+func (s *Statistic) Add(nameBytes []byte, val int64) {
+	name := UnsafeBytesToString(nameBytes)
+	m, ok := s.measures[name]
+	if !ok {
+		s.keys = append(s.keys, nameBytes...)
+		name = UnsafeBytesToString(s.keys[len(s.keys)-len(name):])
+		m = newM()
+		s.measures[name] = m
+	}
+	m.Add(val)
+}
+
+func (s *Statistic) PrintResult() {
+	keys := make([]string, 0, len(s.measures))
+	for key := range s.measures {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	if len(keys) > 0 {
+		fmt.Printf("{")
+		key := keys[0]
+		m := s.measures[key]
+		fmt.Printf("%s=%.1f/%.1f/%.1f", key, float64(m.min)/10, float64(m.sum)/float64(m.count*10), float64(m.max)/10)
+		for _, key := range keys[1:] {
+			m := s.measures[key]
+			fmt.Printf(", %s=%.1f/%.1f/%.1f", key, float64(m.min)/10, float64(m.sum)/float64(m.count*10), float64(m.max)/10)
+		}
+		fmt.Printf("}\n")
 	}
 }
 
@@ -57,8 +105,8 @@ func (m *M) Add(val int64) {
 	}
 }
 
-func parseLine(line string) (string, int64) {
-	idx := strings.Index(line, ";")
+func parseLine(line []byte) ([]byte, int64) {
+	idx := bytes.IndexByte(line, ';')
 	val := int64(0)
 	neg := false
 	if line[idx+1] == '-' {
@@ -93,34 +141,16 @@ func main() {
 	pie(err)
 	defer file.Close()
 
-	statistics := make(map[string]*M)
+	statistic := newStatistic()
 
 	scanner := bufio.NewScanner(file)
+	buffer := make([]byte, 100*1024*1024)
+	scanner.Buffer(buffer, len(buffer))
 	for scanner.Scan() {
-		name, measure := parseLine(scanner.Text())
-		addStatistic(statistics, name, measure)
+		name, measure := parseLine(scanner.Bytes())
+		statistic.Add(name, measure)
 	}
 	pie(scanner.Err())
 
-	keys := make([]string, 0, len(statistics))
-	for key := range statistics {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-
-	if len(statistics) > 0 {
-		fmt.Printf("{")
-		key := keys[0]
-		m, ok := statistics[key]
-		if !ok {
-			panic(fmt.Errorf("key not found: %s", key))
-		}
-		fmt.Printf("%s=%.1f/%.1f/%.1f", key, float64(m.min)/10, float64(m.sum)/float64(m.count*10), float64(m.max)/10)
-		for _, key := range keys[1:] {
-			m := statistics[key]
-			fmt.Printf(", %s=%.1f/%.1f/%.1f", key, float64(m.min)/10, float64(m.sum)/float64(m.count*10), float64(m.max)/10)
-		}
-		fmt.Printf("}\n")
-	}
-
+	statistic.PrintResult()
 }
