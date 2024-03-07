@@ -8,8 +8,10 @@ import (
 	"log"
 	"math"
 	"os"
+	"runtime"
 	"runtime/pprof"
 	"sort"
+	"sync"
 	"unsafe"
 )
 
@@ -50,32 +52,90 @@ func (s *Statistic) Add(nameBytes []byte, val int64) {
 	m.Add(val)
 }
 
+func (s *Statistic) ParseAndAddLines(lines []byte) {
+	for {
+		idx := bytes.IndexByte(lines, ';')
+		if idx < 0 {
+			return
+		}
+		val := int64(0)
+		neg := lines[idx+1] == '-'
+		i := idx + 1
+		for i < len(lines) {
+			if lines[i] == '\n' {
+				i++
+				break
+			}
+			if lines[i] >= '0' && lines[i] <= '9' {
+				val = val*10 + int64(lines[i]-'0')
+			}
+			i++
+		}
+		if neg {
+			val = -val
+		}
+		s.Add(lines[:idx], val)
+		lines = lines[i:]
+	}
+}
+
 func (s *Statistic) PrintResult() {
-	keys := make([]string, 0, len(s.measures))
-	for key := range s.measures {
+	printResult(s.measures)
+}
+
+type MergedStatistics struct {
+	keys     [][]byte
+	measures map[string]*M
+}
+
+func mergeStatistics(slice ...*Statistic) *MergedStatistics {
+	r := &MergedStatistics{
+		measures: make(map[string]*M),
+	}
+
+	for _, s := range slice {
+		r.keys = append(r.keys, s.keys)
+		for name, m := range s.measures {
+			m2, ok := r.measures[name]
+			if !ok {
+				r.measures[name] = m
+			} else {
+				m2.count += m.count
+				m2.sum += m.sum
+				if m.min < m2.min {
+					m2.min = m.min
+				}
+				if m.max > m2.max {
+					m2.max = m.max
+				}
+			}
+		}
+	}
+
+	return r
+}
+
+func (s *MergedStatistics) PrintResult() {
+	printResult(s.measures)
+}
+
+func printResult(measures map[string]*M) {
+	keys := make([]string, 0, len(measures))
+	for key := range measures {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	if len(keys) > 0 {
 		fmt.Printf("{")
 		key := keys[0]
-		m := s.measures[key]
+		m := measures[key]
 		fmt.Printf("%s=%.1f/%.1f/%.1f", key, float64(m.min)/10, float64(m.sum)/float64(m.count*10), float64(m.max)/10)
 		for _, key := range keys[1:] {
-			m := s.measures[key]
+			m := measures[key]
 			fmt.Printf(", %s=%.1f/%.1f/%.1f", key, float64(m.min)/10, float64(m.sum)/float64(m.count*10), float64(m.max)/10)
 		}
 		fmt.Printf("}\n")
 	}
-}
-
-func addStatistic(m map[string]*M, name string, val int64) {
-	_m, ok := m[name]
-	if !ok {
-		_m = newM()
-		m[name] = _m
-	}
-	_m.Add(val)
 }
 
 type M struct {
@@ -105,22 +165,22 @@ func (m *M) Add(val int64) {
 	}
 }
 
-func parseLine(line []byte) ([]byte, int64) {
-	idx := bytes.IndexByte(line, ';')
-	val := int64(0)
-	neg := false
-	if line[idx+1] == '-' {
-		neg = true
+// 相比于scanner默认的SplitFunc，会读取多行，实现方式是按缓冲区中最后一个换行符进行区分
+// 这样读取到的token实际包含多行数据，并且需要注意可能会有多余的'\r'字符
+func scanManyLines(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	if atEOF && len(data) == 0 {
+		return 0, nil, nil
 	}
-	for _, ch := range line[idx+1:] {
-		if ch >= '0' && ch <= '9' {
-			val = val*10 + int64(ch-'0')
-		}
+	if i := bytes.LastIndexByte(data, '\n'); i >= 0 {
+		// We have a full newline-terminated line.
+		return i + 1, data[0:i], nil
 	}
-	if neg {
-		val = -val
+	// If we're at EOF, we have a final, non-terminated line. Return it.
+	if atEOF {
+		return len(data), data, nil
 	}
-	return line[:idx], val
+	// Request more data.
+	return 0, nil, nil
 }
 
 func main() {
@@ -141,16 +201,57 @@ func main() {
 	pie(err)
 	defer file.Close()
 
-	statistic := newStatistic()
+	num := min(8, runtime.NumCPU())
+	statistics := make([]*Statistic, num)
+
+	wg := &sync.WaitGroup{}
+	ch := make(chan []byte)
+	for i := 0; i < num; i++ {
+		go func(idx int) {
+			statistics[idx] = newStatistic()
+			for lines := range ch {
+				statistics[idx].ParseAndAddLines(lines)
+				wg.Done()
+			}
+		}(i)
+	}
 
 	scanner := bufio.NewScanner(file)
-	buffer := make([]byte, 100*1024*1024)
+	buffer := make([]byte, 256*1024*1024)
 	scanner.Buffer(buffer, len(buffer))
+	scanner.Split(scanManyLines)
+
+	sep := []byte("\n")
 	for scanner.Scan() {
-		name, measure := parseLine(scanner.Bytes())
-		statistic.Add(name, measure)
+		data := scanner.Bytes()
+		count := bytes.Count(data, sep)
+
+		step := min(count+1, max(10, (count+1)/num+1))
+
+		var (
+			n          = 0
+			start      = 0
+			batchStart = 0
+		)
+		for {
+			pos := bytes.IndexByte(data[start:], '\n')
+			if pos < 0 {
+				wg.Add(1)
+				ch <- data[batchStart:]
+				break
+			}
+			n++
+			if n%step == 0 {
+				wg.Add(1)
+				ch <- data[batchStart : start+pos]
+				batchStart = start + pos + 1
+			}
+			start = start + pos + 1
+		}
+		wg.Wait()
 	}
 	pie(scanner.Err())
 
+	statistic := mergeStatistics(statistics...)
 	statistic.PrintResult()
 }
